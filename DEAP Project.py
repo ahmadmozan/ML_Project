@@ -11,7 +11,9 @@ Lightweight EEG emotion recognition on DEAP (data_preprocessed_python).
 - Baseline: SVM with PCA on trial-level flattened signals
 
 Run:
-    python DEAP-Project.py --data_dir data_preprocessed_python
+    python DEAP-Project.py --data_dir data_preprocessed_python --n_eeg_channels 12
+Optional:
+    python DEAP-Project.py --data_dir data_preprocessed_python --channel_indices 0,1,2,3,4,5,6,7,8,9,10,11
 """
 import logging
 import platform
@@ -20,7 +22,7 @@ import os
 import pickle
 import random
 import time
-from typing import Dict, List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 from sklearn.decomposition import PCA
@@ -55,7 +57,6 @@ if CODECARBON_AVAILABLE:
 
 # ---------------------- Repro ---------------------- #
 
-
 def set_seed(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -67,12 +68,28 @@ def set_seed(seed: int = 42) -> None:
 
 # ---------------------- Preprocessing ---------------------- #
 
+def _parse_channel_indices(s: Optional[str]) -> Optional[np.ndarray]:
+    """
+    Parse "0,1,2,..."
+    Returns None if s is None.
+    """
+    if s is None:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    parts = [p.strip() for p in s.split(",")]
+    idx = np.array([int(p) for p in parts], dtype=np.int64)
+    return idx
+
 
 def load_deap_python(
     data_dir: str,
     target: str = "valence",
     remove_noisy: bool = False,
     noise_factor: float = 5.0,
+    n_eeg_channels: int = 12,
+    channel_indices: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Load DEAP trials (no windowing) with per-trial/channel z-score after removing 3s baseline.
@@ -81,7 +98,7 @@ def load_deap_python(
         X: (N_trials, C, 7680)
         y: (N_trials,)
         subject_ids: (N_trials,)
-        kept_channels: indices of kept channels
+        kept_channels: indices of kept channels (relative to original 32 EEG channels)
     """
     target_map = {"valence": 0, "arousal": 1, "dominance": 2, "liking": 3}
     if target not in target_map:
@@ -92,22 +109,40 @@ def load_deap_python(
     if not files:
         raise RuntimeError(f"No .dat files found in {data_dir}")
 
+    # Decide which EEG channels to keep (from the original 32 EEG channels)
+    if channel_indices is not None:
+        # Validate user-provided indices
+        if np.any(channel_indices < 0) or np.any(channel_indices > 31):
+            raise ValueError("channel_indices must be between 0 and 31 (inclusive).")
+        kept_channels = channel_indices
+    else:
+        # Default: use the first n_eeg_channels channels
+        if not (1 <= n_eeg_channels <= 32):
+            raise ValueError("--n_eeg_channels must be in [1, 32].")
+        kept_channels = np.arange(n_eeg_channels, dtype=np.int64)
+
     all_X: List[np.ndarray] = []
     all_y: List[np.ndarray] = []
     all_subjects: List[np.ndarray] = []
 
     print(f"Found {len(files)} subject files in {data_dir}")
+    print(f"Using EEG channels: {kept_channels.tolist()} (count={len(kept_channels)})")
+
     for subj_idx, fname in enumerate(files):
         path = os.path.join(data_dir, fname)
         with open(path, "rb") as f:
             sample = pickle.load(f, encoding="latin1")
 
-        data = sample["data"]  # (40, 40, 8064)
+        data = sample["data"]      # (40, 40, 8064)
         labels = sample["labels"]  # (40, 4)
 
-        eeg = data[:, :32, :]  # (40, 32, 8064)
-        eeg = eeg[..., 384 : 384 + 60 * 128]  # remove 3s baseline -> (40, 32, 7680)
+        eeg_full = data[:, :32, :]                       # (40, 32, 8064) EEG only
+        eeg_full = eeg_full[..., 384 : 384 + 60 * 128]   # remove 3s baseline -> (40, 32, 7680)
 
+        # Select subset of channels (12 by default)
+        eeg = eeg_full[:, kept_channels, :]              # (40, C, 7680)
+
+        # Per-trial, per-channel z-score
         mean = eeg.mean(axis=-1, keepdims=True)
         std = eeg.std(axis=-1, keepdims=True)
         std = np.where(std < 1e-6, 1e-6, std)
@@ -124,34 +159,41 @@ def load_deap_python(
     y = np.concatenate(all_y)
     subject_ids = np.concatenate(all_subjects)
 
-    kept_channels = np.arange(X.shape[1])
+    # Optional noisy-channel removal (applied after selecting initial channel set)
     if remove_noisy:
         channel_std = X.std(axis=(0, 2))
         median_std = np.median(channel_std)
-        keep = np.where(channel_std <= median_std * noise_factor)[0]
-        if len(keep) == 0:
-            keep = np.arange(X.shape[1])
-        X = X[:, keep, :]
-        kept_channels = keep
-        print(f"Removed noisy channels, kept {len(kept_channels)} / 32")
+        keep_local = np.where(channel_std <= median_std * noise_factor)[0]
+        if len(keep_local) == 0:
+            keep_local = np.arange(X.shape[1])
+
+        # Map back to original EEG channel indices
+        kept_channels = kept_channels[keep_local]
+        X = X[:, keep_local, :]
+
+        print(f"Removed noisy channels, kept {len(kept_channels)} channels after filtering.")
 
     print(f"Final trials shape: {X.shape}")
     print(f"Class balance (trials): {np.bincount(y)} (0=low, 1=high)")
-    print(f"Channels kept: {len(kept_channels)}")
+    print(f"Channels kept (final): {kept_channels.tolist()} (count={len(kept_channels)})")
     return X, y, subject_ids, kept_channels
 
 
 # ---------------------- Splits ---------------------- #
 
-
-def split_by_subject(subject_ids: np.ndarray, seed: int = 42, train_ratio: float = 0.7, val_ratio: float = 0.15):
+def split_by_subject(
+    subject_ids: np.ndarray,
+    seed: int = 42,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15
+):
     rng = np.random.default_rng(seed)
     unique_ids = np.unique(subject_ids)
     rng.shuffle(unique_ids)
+
     n_subj = len(unique_ids)
     n_train = int(np.floor(n_subj * train_ratio))
     n_val = int(np.floor(n_subj * val_ratio))
-    n_test = n_subj - n_train - n_val
 
     train_subj = unique_ids[:n_train]
     val_subj = unique_ids[n_train : n_train + n_val]
@@ -167,7 +209,6 @@ def split_by_subject(subject_ids: np.ndarray, seed: int = 42, train_ratio: float
 
 
 # ---------------------- Windowing ---------------------- #
-
 
 def create_windows(
     X: np.ndarray,
@@ -204,7 +245,6 @@ def undersample_majority(X: np.ndarray, y: np.ndarray, seed: int = 42) -> Tuple[
 
 # ---------------------- Dataset ---------------------- #
 
-
 class DEAPEEGDataset(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray):
         self.X = X.astype(np.float32)
@@ -220,7 +260,6 @@ class DEAPEEGDataset(Dataset):
 
 
 # ---------------------- Model ---------------------- #
-
 
 class SEBlock(nn.Module):
     def __init__(self, channels: int, reduction: int = 8):
@@ -279,7 +318,6 @@ class EEGConvNet(nn.Module):
 
 # ---------------------- Training helpers ---------------------- #
 
-
 def train_one_epoch(model, loader, criterion, optimizer, device) -> float:
     model.train()
     total_loss = 0.0
@@ -307,11 +345,13 @@ def evaluate(model, loader, criterion, device, return_preds: bool = False):
             total_loss += loss.item() * Xb.size(0)
             all_preds.append(preds.cpu().numpy())
             all_targets.append(yb.cpu().numpy())
+
     y_true = np.concatenate(all_targets)
     y_pred = np.concatenate(all_preds)
     acc = accuracy_score(y_true, y_pred)
     f1 = f1_score(y_true, y_pred, zero_division=0)
     avg_loss = total_loss / max(1, len(loader.dataset))
+
     if return_preds:
         return avg_loss, acc, f1, y_true, y_pred
     return avg_loss, acc, f1
@@ -337,8 +377,7 @@ def measure_inference_time(model, loader, device) -> float:
     return (elapsed / n_samples) if n_samples > 0 else 0.0
 
 
-# -------- NEW: very small Arduino-style simulation helper -------- #
-
+# -------- Arduino-style simulation helper -------- #
 
 def simulate_arduino(model: nn.Module, size_mb: float, infer_time_per_sample: float) -> None:
     """
@@ -348,22 +387,19 @@ def simulate_arduino(model: nn.Module, size_mb: float, infer_time_per_sample: fl
       - 2 KB SRAM
       - 16 MHz clock
     """
-    # Model size in KB (flash)
     total_params = sum(p.numel() for p in model.parameters())
     total_buffers = sum(b.numel() for b in model.buffers())
     model_bytes = (total_params + total_buffers) * 4
     model_kb = model_bytes / 1024.0
 
-    flash_kb = 32.0       # typical Uno flash
-    sram_kb = 2.0         # typical Uno SRAM
+    flash_kb = 32.0
+    sram_kb = 2.0
     arduino_clock_mhz = 16.0
-    host_clock_ghz = 2.5  # rough assumption for your laptop/PC
+    host_clock_ghz = 2.5  # rough assumption
 
-    # Very rough latency scaling by clock ratio (ignores memory, SIMD, etc.)
     clock_ratio = (host_clock_ghz * 1000.0) / arduino_clock_mhz
     arduino_ms = infer_time_per_sample * 1000.0 * clock_ratio
 
-    # Single summary line (so your original prints remain basically unchanged)
     print(
         f"[Arduino sim] ~{model_kb:.0f} KB model vs {flash_kb:.0f} KB flash, "
         f"{sram_kb:.0f} KB SRAM, est. {arduino_ms:.0f} ms/sample (very rough)."
@@ -371,7 +407,6 @@ def simulate_arduino(model: nn.Module, size_mb: float, infer_time_per_sample: fl
 
 
 # ---------------------- SVM baseline ---------------------- #
-
 
 def train_evaluate_svm(
     X: np.ndarray,
@@ -414,7 +449,6 @@ def train_evaluate_svm(
 
 # ---------------------- Main ---------------------- #
 
-
 def main():
     parser = argparse.ArgumentParser(description="DEAP EEG Emotion Recognition (CNN + SVM)")
     parser.add_argument("--data_dir", type=str, required=True, help="Path to data_preprocessed_python")
@@ -425,6 +459,16 @@ def main():
         choices=["valence", "arousal", "dominance", "liking"],
         help="Which DEAP label to binarize (col index)",
     )
+
+    # NEW: channels control
+    parser.add_argument("--n_eeg_channels", type=int, default=12, help="Number of EEG channels to use (default=12)")
+    parser.add_argument(
+        "--channel_indices",
+        type=str,
+        default=None,
+        help="Comma-separated EEG channel indices from [0..31]. Overrides --n_eeg_channels. Example: 0,1,2,...,11",
+    )
+
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -456,6 +500,8 @@ def main():
     if not os.path.isdir(args.data_dir):
         raise FileNotFoundError(f"data_dir not found: {args.data_dir}")
 
+    channel_indices = _parse_channel_indices(args.channel_indices)
+
     # --------- start global timer + optional energy tracker ----------
     overall_start = time.perf_counter()
 
@@ -469,7 +515,12 @@ def main():
 
     print(f"Loading DEAP from: {args.data_dir}")
     X_trials, y_trials, subject_ids, kept_channels = load_deap_python(
-        args.data_dir, target=args.target, remove_noisy=args.remove_noisy, noise_factor=args.noise_factor
+        args.data_dir,
+        target=args.target,
+        remove_noisy=args.remove_noisy,
+        noise_factor=args.noise_factor,
+        n_eeg_channels=args.n_eeg_channels,
+        channel_indices=channel_indices,
     )
 
     # Subject-wise trial split
@@ -537,10 +588,8 @@ def main():
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # Threshold tuning on validation windows (keep default threshold here)
-    val_loss_full, val_acc_full, val_f1_full, y_true_val, y_pred_val = evaluate(
-        model, val_loader, criterion, device, return_preds=True
-    )
+    # Threshold tuning on validation windows (kept default threshold here)
+    _ = evaluate(model, val_loader, criterion, device, return_preds=True)
     best_thr = 0.5
     print(f"Using default decision threshold: {best_thr}")
 
@@ -560,10 +609,10 @@ def main():
     print(f"Model size: {size_mb:.2f} MB")
     print(f"Inference time per sample: {infer_time*1000:.3f} ms")
 
-    # ---- NEW: single-line Arduino simulation call (comment out if not needed) ----
+    # Arduino simulation
     simulate_arduino(model, size_mb, infer_time)
 
-    # SVM baseline on trial-level flattened signals (train/val/test trials)
+    # SVM baseline on trial-level flattened signals
     svm_results = train_evaluate_svm(
         X_trials, y_trials, idx_train_trials, idx_val_trials, idx_test_trials, n_components=args.svm_pca_components
     )
@@ -576,21 +625,17 @@ def main():
     )
     print("============================================")
 
-    # --------- stop energy tracker + print runtime summary ----------
+    # Stop energy tracker + runtime summary
     emissions_kg = None
     if tracker is not None:
         emissions_kg = tracker.stop()
 
-    overall_end = time.perf_counter()
-    total_seconds = overall_end - overall_start
-
-    # Simple system summary
+    total_seconds = time.perf_counter() - overall_start
     system_str = f"{platform.system()} {platform.release()}, CPU threads: {os.cpu_count()}, device: {device}"
 
     print("\n========== RUNTIME & ENERGY SUMMARY ==========")
     print(f"System: {system_str}")
-    print(f"Total runtime (CNN + SVM): {total_seconds:.2f} seconds "
-          f"({total_seconds/60.0:.2f} minutes).")
+    print(f"Total runtime (CNN + SVM): {total_seconds:.2f} seconds ({total_seconds/60.0:.2f} minutes).")
     if emissions_kg is not None:
         print(f"Estimated carbon emissions: {emissions_kg:.6f} kg CO2eq (CodeCarbon estimate).")
     print("============================================")
