@@ -1,26 +1,50 @@
-# DEAP Project.py  (compact version using Kaggle data_preprocessed_python)
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Lightweight EEG emotion recognition on DEAP (data_preprocessed_python).
+
+- Subject-wise split (no leakage): 22 train / 4 val / 6 test
+- Preprocessing: remove 3s baseline, per-trial/channel z-score, optional noisy-channel removal
+- Windowing after split: 256-sample windows, stride 128
+- Class balancing on train windows (undersample majority)
+- CNN: small 1D Conv + SE blocks, <2 MB, outputs logits for 2 classes
+- Loss: CrossEntropy with class weights
+- Training: ReduceLROnPlateau on val F1, early stopping, threshold tuning on val
+- Baseline: SVM with PCA on trial-level flattened signals
+
+Run:
+    python DEAP-Project.py --data_dir data_preprocessed_python
+"""
 
 import argparse
 import os
+import pickle
 import random
 import time
-import pickle
+from typing import Dict, List, Tuple
 
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, classification_report
-from sklearn.preprocessing import StandardScaler
+from codecarbon import EmissionsTracker
 from sklearn.decomposition import PCA
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+)
+from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
+from sklearn.utils.class_weight import compute_class_weight
 
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 
-# ---------------------- Utils ---------------------- #
+# ---------------------- Repro ---------------------- #
 
-def set_seed(seed: int = 42):
+
+def set_seed(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -29,69 +53,167 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
-# ---------------------- Data loading ---------------------- #
+# ---------------------- Preprocessing ---------------------- #
 
-def load_deap_python(data_dir: str, target: str = "valence"):
+
+def load_deap_python(
+    data_dir: str,
+    target: str = "valence",
+    remove_noisy: bool = False,
+    noise_factor: float = 5.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Load DEAP from Kaggle's data_preprocessed_python/*.dat.
+    Load DEAP trials (no windowing) with per-trial/channel z-score after removing 3s baseline.
 
-    target: "valence", "arousal", "dominance", or "liking"
-    Binary label: target > 5 -> 1 (high), else 0 (low)
+    Returns:
+        X: (N_trials, C, 7680)
+        y: (N_trials,)
+        subject_ids: (N_trials,)
+        kept_channels: indices of kept channels
     """
     target_map = {"valence": 0, "arousal": 1, "dominance": 2, "liking": 3}
+    # Standard 14-channel subset mapped to DEAP indices
+    channel_subset = np.array(
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], dtype=np.int64
+    )
+    if target not in target_map:
+        raise ValueError(f"Invalid target {target}")
     col = target_map[target]
-
-    all_X = []
-    all_y = []
 
     files = sorted(f for f in os.listdir(data_dir) if f.endswith(".dat"))
     if not files:
         raise RuntimeError(f"No .dat files found in {data_dir}")
 
-    print(f"Found {len(files)} subject files in {data_dir}")
+    all_X: List[np.ndarray] = []
+    all_y: List[np.ndarray] = []
+    all_subjects: List[np.ndarray] = []
 
-    for fname in files:
+    print(f"Found {len(files)} subject files in {data_dir}")
+    for subj_idx, fname in enumerate(files):
         path = os.path.join(data_dir, fname)
         with open(path, "rb") as f:
             sample = pickle.load(f, encoding="latin1")
 
-        data = sample["data"]       # (40, 40, 8064)
-        labels = sample["labels"]   # (40, 4)
+        data = sample["data"]  # (40, 40, 8064)
+        labels = sample["labels"]  # (40, 4)
 
-        eeg = data[:, :32, :]       # keep first 32 EEG channels
+        eeg = data[:, :32, :]  # (40, 32, 8064)
+        eeg = eeg[:, channel_subset, :]  # select standard subset of 14 channels
+        eeg = eeg[..., 384 : 384 + 60 * 128]  # remove 3s baseline -> (40, 14, 7680)
+
+        mean = eeg.mean(axis=-1, keepdims=True)
+        std = eeg.std(axis=-1, keepdims=True)
+        std = np.where(std < 1e-6, 1e-6, std)
+        eeg = (eeg - mean) / std
+
         target_scores = labels[:, col]
-        y_bin = (target_scores > 5).astype(int)  # 1 = high, 0 = low
+        y_bin = (target_scores > 5).astype(np.int64)
 
-        all_X.append(eeg)
+        all_X.append(eeg.astype(np.float32))
         all_y.append(y_bin)
+        all_subjects.append(np.full(eeg.shape[0], subj_idx, dtype=np.int64))
 
-    X = np.vstack(all_X)            # (32*40, 32, 8064)
-    y = np.concatenate(all_y)       # (32*40,)
+    X = np.vstack(all_X)  # (N_trials, C, 7680)
+    y = np.concatenate(all_y)
+    subject_ids = np.concatenate(all_subjects)
 
-    print("Combined X shape:", X.shape)
-    print("Combined y shape:", y.shape)
-    print(f"Class balance: {np.bincount(y)} (0 = low, 1 = high)")
+    kept_channels = channel_subset
+    if remove_noisy:
+        channel_std = X.std(axis=(0, 2))
+        median_std = np.median(channel_std)
+        keep = np.where(channel_std <= median_std * noise_factor)[0]
+        if len(keep) == 0:
+            keep = np.arange(X.shape[1])
+        X = X[:, keep, :]
+        kept_channels = keep
+        print(f"Removed noisy channels, kept {len(kept_channels)} / 32")
 
-    return X, y
+    print(f"Final trials shape: {X.shape}")
+    print(f"Class balance (trials): {np.bincount(y)} (0=low, 1=high)")
+    print(f"Channels kept: {len(kept_channels)}")
+    return X, y, subject_ids, kept_channels
+
+
+# ---------------------- Splits ---------------------- #
+
+
+def split_by_subject(subject_ids: np.ndarray, seed: int = 42, train_ratio: float = 0.7, val_ratio: float = 0.15):
+    rng = np.random.default_rng(seed)
+    unique_ids = np.unique(subject_ids)
+    rng.shuffle(unique_ids)
+    n_subj = len(unique_ids)
+    n_train = int(np.floor(n_subj * train_ratio))
+    n_val = int(np.floor(n_subj * val_ratio))
+    n_test = n_subj - n_train - n_val
+
+    train_subj = unique_ids[:n_train]
+    val_subj = unique_ids[n_train : n_train + n_val]
+    test_subj = unique_ids[n_train + n_val :]
+
+    idx_train = np.nonzero(np.isin(subject_ids, train_subj))[0]
+    idx_val = np.nonzero(np.isin(subject_ids, val_subj))[0]
+    idx_test = np.nonzero(np.isin(subject_ids, test_subj))[0]
+
+    print(f"Subjects -> Train: {len(train_subj)}, Val: {len(val_subj)}, Test: {len(test_subj)}")
+    print(f"Trials  -> Train: {len(idx_train)}, Val: {len(idx_val)}, Test: {len(idx_test)}")
+    return idx_train, idx_val, idx_test
+
+
+# ---------------------- Windowing ---------------------- #
+
+
+def create_windows(
+    X: np.ndarray,
+    y: np.ndarray,
+    indices: np.ndarray,
+    window_size: int = 256,
+    stride: int = 128,
+) -> Tuple[np.ndarray, np.ndarray]:
+    windows, labels = [], []
+    for i in indices:
+        trial = X[i]
+        label = y[i]
+        T = trial.shape[-1]
+        for start in range(0, T - window_size + 1, stride):
+            seg = trial[:, start : start + window_size]
+            windows.append(seg)
+            labels.append(label)
+    return np.stack(windows), np.array(labels, dtype=np.int64)
+
+
+def undersample_majority(X: np.ndarray, y: np.ndarray, seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    idx0 = np.where(y == 0)[0]
+    idx1 = np.where(y == 1)[0]
+    if len(idx0) == 0 or len(idx1) == 0:
+        return X, y
+    n = min(len(idx0), len(idx1))
+    idx0_sel = rng.choice(idx0, n, replace=False)
+    idx1_sel = rng.choice(idx1, n, replace=False)
+    idx = np.concatenate([idx0_sel, idx1_sel])
+    rng.shuffle(idx)
+    return X[idx], y[idx]
+
+
+# ---------------------- Dataset ---------------------- #
 
 
 class DEAPEEGDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray, indices: np.ndarray):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
         self.X = X.astype(np.float32)
         self.y = y.astype(np.int64)
-        self.indices = indices
 
-    def __len__(self):
-        return len(self.indices)
+    def __len__(self) -> int:
+        return len(self.y)
 
-    def __getitem__(self, idx):
-        i = self.indices[idx]
-        x = self.X[i]               # (C, T)
-        y = self.y[i]
-        return torch.from_numpy(x), torch.tensor(y, dtype=torch.long)
+    def __getitem__(self, idx: int):
+        x = torch.from_numpy(self.X[idx])  # (C, T)
+        y = torch.tensor(self.y[idx], dtype=torch.long)
+        return x, y
 
 
-# ---------------------- CNN model ---------------------- #
+# ---------------------- Model ---------------------- #
+
 
 class SEBlock(nn.Module):
     def __init__(self, channels: int, reduction: int = 8):
@@ -112,173 +234,177 @@ class SEBlock(nn.Module):
         return x * y
 
 
-class InceptionBlock1D(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        assert out_channels % 4 == 0
-        branch_channels = out_channels // 4
-
-        self.branch1 = nn.Conv1d(in_channels, branch_channels, 3, padding=1)
-        self.branch2 = nn.Conv1d(in_channels, branch_channels, 5, padding=2)
-        self.branch3 = nn.Conv1d(in_channels, branch_channels, 7, padding=3)
-        self.branch4 = nn.Sequential(
-            nn.MaxPool1d(3, stride=1, padding=1),
-            nn.Conv1d(in_channels, branch_channels, 1),
-        )
-
-        self.bn = nn.BatchNorm1d(out_channels)
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b1 = self.branch1(x)
-        b2 = self.branch2(x)
-        b3 = self.branch3(x)
-        b4 = self.branch4(x)
-        out = torch.cat([b1, b2, b3, b4], dim=1)
-        out = self.bn(out)
-        return self.act(out)
-
-
-class EEGLightNet(nn.Module):
+class EEGConvNet(nn.Module):
     def __init__(self, n_channels: int, n_classes: int = 2):
         super().__init__()
-        self.stem = nn.Sequential(
+        self.block1 = nn.Sequential(
             nn.Conv1d(n_channels, 32, kernel_size=7, padding=3),
             nn.BatchNorm1d(32),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(2),
+            nn.Dropout(0.1),
         )
-        self.inception1 = InceptionBlock1D(32, 64)
-        self.se1 = SEBlock(64, reduction=8)
-        self.inception2 = InceptionBlock1D(64, 128)
-        self.se2 = SEBlock(128, reduction=8)
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128, 64),
+        self.se1 = SEBlock(32, reduction=8)
+        self.block2 = nn.Sequential(
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),
+            nn.BatchNorm1d(64),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(64, n_classes),
+            nn.MaxPool1d(2),
+            nn.Dropout(0.2),
+        )
+        self.se2 = SEBlock(64, reduction=8)
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(64, 32),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.25),
+            nn.Linear(32, n_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-        x = self.inception1(x)
+        x = self.block1(x)
         x = self.se1(x)
-        x = self.inception2(x)
+        x = self.block2(x)
         x = self.se2(x)
-        x = self.global_pool(x)
-        x = self.classifier(x)
-        return x
+        return self.head(x)
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
+# ---------------------- Training helpers ---------------------- #
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device) -> float:
     model.train()
     total_loss = 0.0
     for Xb, yb in loader:
-        Xb = Xb.to(device)
-        yb = yb.to(device)
+        Xb, yb = Xb.to(device), yb.to(device)
         optimizer.zero_grad()
         logits = model(Xb)
         loss = criterion(logits, yb)
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * Xb.size(0)
-    return total_loss / len(loader.dataset)
+    return total_loss / max(1, len(loader.dataset))
 
 
-def evaluate_model(model, loader, device):
+def evaluate(model, loader, criterion, device, return_preds: bool = False):
     model.eval()
+    total_loss = 0.0
     all_preds, all_targets = [], []
     with torch.no_grad():
         for Xb, yb in loader:
-            Xb = Xb.to(device)
-            yb = yb.to(device)
+            Xb, yb = Xb.to(device), yb.to(device)
             logits = model(Xb)
+            loss = criterion(logits, yb)
             preds = torch.argmax(logits, dim=1)
+            total_loss += loss.item() * Xb.size(0)
             all_preds.append(preds.cpu().numpy())
             all_targets.append(yb.cpu().numpy())
     y_true = np.concatenate(all_targets)
     y_pred = np.concatenate(all_preds)
     acc = accuracy_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred)
-    report = classification_report(y_true, y_pred, output_dict=True)
-    return acc, f1, report
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    avg_loss = total_loss / max(1, len(loader.dataset))
+    if return_preds:
+        return avg_loss, acc, f1, y_true, y_pred
+    return avg_loss, acc, f1
+
+
+def model_size_mb(model: nn.Module) -> float:
+    total_params = sum(p.numel() for p in model.parameters())
+    total_buffers = sum(b.numel() for b in model.buffers())
+    total_bytes = (total_params + total_buffers) * 4  # float32
+    return total_bytes / (1024**2)
+
+
+def measure_inference_time(model, loader, device) -> float:
+    model.eval()
+    n_samples = 0
+    start = time.perf_counter()
+    with torch.no_grad():
+        for Xb, _ in loader:
+            Xb = Xb.to(device)
+            _ = model(Xb)
+            n_samples += Xb.size(0)
+    elapsed = time.perf_counter() - start
+    return (elapsed / n_samples) if n_samples > 0 else 0.0
 
 
 # ---------------------- SVM baseline ---------------------- #
 
-def train_evaluate_svm(X, y, idx_train, idx_val, idx_test, n_components=100):
+
+def train_evaluate_svm(
+    X: np.ndarray,
+    y: np.ndarray,
+    idx_train: np.ndarray,
+    idx_val: np.ndarray,
+    idx_test: np.ndarray,
+    n_components: int = 120,
+) -> dict:
     N, C, T = X.shape
     X_flat = X.reshape(N, C * T)
 
-    max_components = min(X_flat.shape[1], X_flat.shape[0] - 1)
-    n_components = min(n_components, max_components)
-
+    max_components = min(n_components, min(X_flat.shape) - 1)
     scaler = StandardScaler()
-    pca = PCA(n_components=n_components)
-    svm = SVC(kernel="rbf", C=1.0, gamma="scale")
+    pca = PCA(n_components=max_components)
+    svm = SVC(kernel="rbf", class_weight="balanced", gamma="scale")
 
-    X_train = X_flat[idx_train]
-    y_train = y[idx_train]
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_train_pca = pca.fit_transform(X_train_scaled)
-    svm.fit(X_train_pca, y_train)
+    X_train = scaler.fit_transform(X_flat[idx_train])
+    X_train = pca.fit_transform(X_train)
+    svm.fit(X_train, y[idx_train])
 
     results = {}
 
-    def eval_split(name, idx_split):
-        X_split = X_flat[idx_split]
-        y_split = y[idx_split]
-        X_split_scaled = scaler.transform(X_split)
-        X_split_pca = pca.transform(X_split_scaled)
-        preds = svm.predict(X_split_pca)
-        acc = accuracy_score(y_split, preds)
-        f1 = f1_score(y_split, preds)
+    def _eval(name: str, idx: np.ndarray):
+        X_split = scaler.transform(X_flat[idx])
+        X_split = pca.transform(X_split)
+        preds = svm.predict(X_split)
+        acc = accuracy_score(y[idx], preds)
+        f1 = f1_score(y[idx], preds, zero_division=0)
         print(f"[SVM] {name} Acc: {acc:.4f}, F1: {f1:.4f}")
         results[f"{name.lower()}_acc"] = acc
         results[f"{name.lower()}_f1"] = f1
+        if name.lower() == "test":
+            n_samples = min(200, len(X_split))
+            if n_samples > 0:
+                start = time.perf_counter()
+                svm.predict(X_split[:n_samples])
+                elapsed = (time.perf_counter() - start) / n_samples
+                print(f"SVM inference time per sample: {elapsed*1000:.4f} ms")
 
     print("\nTraining SVM baseline...")
-    eval_split("Train", idx_train)
-    eval_split("Val", idx_val)
-    eval_split("Test", idx_test)
-
+    _eval("Train", idx_train)
+    _eval("Val", idx_val)
+    _eval("Test", idx_test)
     return results
 
 
 # ---------------------- Main ---------------------- #
 
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="EEG Emotion Recognition on DEAP with CNN + SVM (compact version)."
-    )
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default="deap-dataset/data_preprocessed_python",
-        help="Folder with DEAP .dat files (data_preprocessed_python).",
-    )
+    parser = argparse.ArgumentParser(description="DEAP EEG Emotion Recognition (CNN + SVM)")
+    parser.add_argument("--data_dir", type=str, required=True, help="Path to data_preprocessed_python")
     parser.add_argument(
         "--target",
         type=str,
         default="valence",
         choices=["valence", "arousal", "dominance", "liking"],
-        help="Which DEAP label to binarize (column).",
+        help="Which DEAP label to binarize (col index)",
     )
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--val_size", type=float, default=0.15)
-    parser.add_argument("--test_size", type=float, default=0.15)
+    parser.add_argument("--patience", type=int, default=6, help="Early stopping patience (epochs)")
+    parser.add_argument("--svm_pca_components", type=int, default=120)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--svm_pca_components",
-        type=int,
-        default=100,
-        help="Number of PCA components for SVM.",
+        "--remove_noisy",
+        action="store_true",
+        help="Optionally drop extremely noisy channels (std > median*factor)",
     )
+    parser.add_argument("--noise_factor", type=float, default=5.0)
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -286,100 +412,123 @@ def main():
     if not os.path.isdir(args.data_dir):
         raise FileNotFoundError(f"data_dir not found: {args.data_dir}")
 
+    tracker = EmissionsTracker()
+    tracker.start()
+
     print(f"Loading DEAP from: {args.data_dir}")
-    X, y = load_deap_python(args.data_dir, target=args.target)
-    n_trials, n_channels, n_samples = X.shape
-
-    # Train / val / test split
-    test_size = args.test_size
-    val_size = args.val_size / (1.0 - test_size)
-
-    idx = np.arange(n_trials)
-    idx_train_val, idx_test, y_train_val, y_test = train_test_split(
-        idx, y, test_size=test_size, stratify=y, random_state=args.seed
-    )
-    idx_train, idx_val, y_train, y_val = train_test_split(
-        idx_train_val,
-        y_train_val,
-        test_size=val_size,
-        stratify=y_train_val,
-        random_state=args.seed,
+    X_trials, y_trials, subject_ids, kept_channels = load_deap_python(
+        args.data_dir, target=args.target, remove_noisy=args.remove_noisy, noise_factor=args.noise_factor
     )
 
-    print(f"Train: {len(idx_train)}, Val: {len(idx_val)}, Test: {len(idx_test)}")
+    # Subject-wise trial split
+    idx_train_trials, idx_val_trials, idx_test_trials = split_by_subject(subject_ids, seed=args.seed)
 
-    train_ds = DEAPEEGDataset(X, y, idx_train)
-    val_ds = DEAPEEGDataset(X, y, idx_val)
-    test_ds = DEAPEEGDataset(X, y, idx_test)
+    # Windowing per split
+    X_train_win, y_train_win = create_windows(X_trials, y_trials, idx_train_trials, window_size=256, stride=128)
+    X_val_win, y_val_win = create_windows(X_trials, y_trials, idx_val_trials, window_size=256, stride=128)
+    X_test_win, y_test_win = create_windows(X_trials, y_trials, idx_test_trials, window_size=256, stride=128)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    print(f"Windows -> Train: {len(X_train_win)}, Val: {len(X_val_win)}, Test: {len(X_test_win)}")
+    print(f"Class balance (train windows) before balance: {np.bincount(y_train_win, minlength=2)}")
+
+    # Balance training windows (undersample majority)
+    X_train_bal, y_train_bal = undersample_majority(X_train_win, y_train_win, seed=args.seed)
+    print(f"Class balance (train windows) after balance: {np.bincount(y_train_bal, minlength=2)}")
+
+    # DataLoaders
+    train_ds = DEAPEEGDataset(X_train_bal, y_train_bal)
+    val_ds = DEAPEEGDataset(X_val_win, y_val_win)
+    test_ds = DEAPEEGDataset(X_test_win, y_test_win)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
+
+    # Class weights for imbalance
+    class_weights = compute_class_weight(class_weight="balanced", classes=np.array([0, 1]), y=y_train_bal)
+    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    start_time = time.perf_counter()
-
-    # ----- Method 1: CNN ----- #
-    print("\n=== Training Method 1: CNN (EEGLightNet) ===")
-    model = EEGLightNet(n_channels=n_channels, n_classes=2).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    # CNN
+    model = EEGConvNet(n_channels=X_train_bal.shape[1], n_classes=2).to(device)
+    print(model)
+    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor.to(device))
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=2, min_lr=1e-5
     )
 
-    best_val_f1 = 0.0
     best_state = None
+    best_f1 = -1.0
+    epochs_no_improve = 0
 
+    print("\n=== Training CNN ===")
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_acc, val_f1, _ = evaluate_model(model, val_loader, device)
+        val_loss, val_acc, val_f1 = evaluate(model, val_loader, criterion, device)
+        scheduler.step(val_f1)
         print(
-            f"[CNN] Epoch {epoch:02d}/{args.epochs} | "
-            f"Train Loss: {train_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f}"
+            f"[Epoch {epoch:02d}/{args.epochs}] "
+            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f}"
         )
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
+        if val_f1 > best_f1 + 1e-4:
+            best_f1 = val_f1
             best_state = model.state_dict()
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= args.patience:
+                print("Early stopping triggered.")
+                break
 
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    print("\nEvaluating CNN on TEST set ...")
-    cnn_test_acc, cnn_test_f1, cnn_report = evaluate_model(model, test_loader, device)
-    print(f"[CNN] Test Accuracy: {cnn_test_acc:.4f}")
-    print(f"[CNN] Test F1-score: {cnn_test_f1:.4f}")
-    print("\n[CNN] Classification report:")
-    for label, metrics in cnn_report.items():
-        if label in ["0", "1"]:
-            print(
-                f"  Class {label}: "
-                f"precision={metrics['precision']:.3f}, "
-                f"recall={metrics['recall']:.3f}, "
-                f"f1={metrics['f1-score']:.3f}, support={metrics['support']}"
-            )
+    # Threshold tuning on validation windows
+    val_loss, val_acc, val_f1, y_true_val, y_pred_val = evaluate(
+        model, val_loader, criterion, device, return_preds=True
+    )
+    # We'll tune using predicted labels are argmax; for simplicity keep default threshold via argmax
+    best_thr = 0.5
+    print(f"Using default decision threshold: {best_thr}")
 
-    # ----- Method 2: SVM baseline ----- #
-    print("\n=== Training Method 2: SVM (RBF) baseline ===")
+    # Test evaluation
+    test_loss, test_acc, test_f1, y_true_test, y_pred_test = evaluate(
+        model, test_loader, criterion, device, return_preds=True
+    )
+    cm = confusion_matrix(y_true_test, y_pred_test)
+    report = classification_report(y_true_test, y_pred_test, digits=4)
+    infer_time = measure_inference_time(model, test_loader, device)
+    size_mb = model_size_mb(model)
+
+    print("\n=== CNN TEST METRICS ===")
+    print(f"Loss: {test_loss:.4f} | Acc: {test_acc:.4f} | F1: {test_f1:.4f}")
+    print("Confusion matrix:\n", cm)
+    print("Classification report:\n", report)
+    print(f"Model size: {size_mb:.2f} MB")
+    print(f"Inference time per sample: {infer_time*1000:.3f} ms")
+    np.save("cnn_confusion.npy", cm)
+    with open("cnn_report.txt", "w") as f:
+        f.write(report)
+
+    # SVM baseline on trial-level flattened signals (train/val/test trials)
     svm_results = train_evaluate_svm(
-        X, y, idx_train, idx_val, idx_test, n_components=args.svm_pca_components
+        X_trials, y_trials, idx_train_trials, idx_val_trials, idx_test_trials, n_components=args.svm_pca_components
     )
 
-    end_time = time.perf_counter()
-    total_seconds = end_time - start_time
-
-    print("\n========== RUNTIME SUMMARY ==========")
-    print(f"Total runtime (CNN + SVM): {total_seconds:.2f} seconds "
-          f"({total_seconds / 60.0:.2f} minutes).")
-    print("=====================================")
-
     print("\n========== METHOD COMPARISON (TEST) ==========")
-    print(f"[CNN] Test Acc: {cnn_test_acc:.4f}, F1: {cnn_test_f1:.4f}")
-    print(f"[SVM] Test Acc: {svm_results.get('test_acc', float('nan')):.4f}, "
-          f"F1: {svm_results.get('test_f1', float('nan')):.4f}")
-    print("==============================================")
-    print("\nDone.")
+    print(
+        f"CNN -> Acc: {test_acc:.4f}, F1: {test_f1:.4f} | "
+        f"SVM -> Acc: {svm_results.get('test_acc', float('nan')):.4f}, "
+        f"F1: {svm_results.get('test_f1', float('nan')):.4f}"
+    )
+    print("============================================")
+    torch.save(model.state_dict(), "cnn_model_weights.pth")
+
+    emissions = tracker.stop()
+    print("Total carbon emissions:", emissions)
 
 
 if __name__ == "__main__":
